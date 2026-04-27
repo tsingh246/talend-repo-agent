@@ -1,0 +1,15 @@
+services:
+  pgvector:
+    image: ankane/pgvector
+    container_name: talend-kb-pgvector
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: talend_kb
+    ports:
+      - "5432:5432"
+    volumes:
+      - talend_kb_pgdata:/var/lib/postgresql/data
+
+volumes:
+  talend_kb_pgdata:
