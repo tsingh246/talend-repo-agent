@@ -340,6 +340,7 @@ def render_artifact_detail(artifact) -> None:
     st.write(artifact.summary or "")
 
     render_job_flow_preview(artifact)
+    render_artifact_blueprint(artifact)
     render_job_dependencies(artifact)
     render_artifact_evidence(artifact)
 
@@ -575,6 +576,244 @@ def extract_screenshot_image(screenshot_path: Path) -> bytes | None:
     except Exception:
         return None
 
+
+def render_artifact_blueprint(artifact) -> None:
+    blueprint = build_artifact_blueprint(artifact)
+    with st.expander("ETL Blueprint", expanded=True):
+        st.caption("Implementation-neutral design generated from parsed Talend evidence.")
+
+        overview_cols = st.columns(4)
+        overview_cols[0].metric("Components", len(blueprint["components"]))
+        overview_cols[1].metric("SQL Operations", len(blueprint["sql_operations"]))
+        overview_cols[2].metric("Contexts", len(blueprint["contexts"]))
+        overview_cols[3].metric("Dependencies", len(blueprint["dependencies"]))
+
+        st.write("**Purpose:**")
+        st.write(blueprint["purpose"])
+
+        st.write("**Design Summary:**")
+        st.dataframe(build_blueprint_summary_rows(blueprint), use_container_width=True, hide_index=True)
+
+        tabs = st.tabs(["Sources / Targets", "Flow", "Config", "Blueprint YAML"])
+        with tabs[0]:
+            render_blueprint_list("Source tables", blueprint["source_tables"])
+            render_blueprint_list("Target tables", blueprint["target_tables"])
+            render_blueprint_list("Columns / fields", blueprint["fields"])
+        with tabs[1]:
+            render_blueprint_list("Components", blueprint["components"])
+            render_blueprint_list("SQL operations", blueprint["sql_operations"])
+            render_blueprint_list("Child jobs", blueprint["dependencies"])
+        with tabs[2]:
+            render_blueprint_list("Context variables", blueprint["contexts"])
+            render_blueprint_list("Authentication signals", blueprint["auth_signals"])
+            render_blueprint_list("Implementation notes", blueprint["implementation_notes"])
+        with tabs[3]:
+            yaml_text = format_blueprint_yaml(blueprint)
+            st.code(yaml_text, language="yaml")
+            st.download_button(
+                "Download Blueprint YAML",
+                data=yaml_text,
+                file_name=f"{safe_filename(artifact.name)}_blueprint.yaml",
+                mime="text/yaml",
+            )
+
+
+def build_artifact_blueprint(artifact) -> dict:
+    evidence = parse_json_object(artifact.evidence_json)
+    sql_items = evidence.get("sql") or []
+    dependencies = evidence.get("job_dependencies") or parse_job_dependencies(artifact.job_dependencies)
+    components = dedupe_keep_order(evidence.get("components") or split_component_text(artifact.component_types))
+    source_tables = collect_blueprint_tables(sql_items, source=True)
+    target_tables = collect_blueprint_tables(sql_items, source=False)
+    all_tables = dedupe_keep_order(source_tables + target_tables)
+    fields = collect_blueprint_fields(evidence, sql_items)
+
+    return {
+        "job_name": artifact.name,
+        "artifact_type": artifact.artifact_type,
+        "project": artifact.project_name or "",
+        "repo": artifact.repo_name,
+        "purpose": infer_blueprint_purpose(artifact, evidence, source_tables, target_tables),
+        "pattern": infer_blueprint_pattern(components, sql_items, dependencies),
+        "source_tables": source_tables or all_tables,
+        "target_tables": target_tables,
+        "fields": fields,
+        "components": components[:30],
+        "sql_operations": format_blueprint_sql_operations(sql_items),
+        "contexts": dedupe_keep_order(evidence.get("context_refs") or [])[:30],
+        "auth_signals": dedupe_keep_order(evidence.get("auth_signals") or [])[:20],
+        "config_signals": dedupe_keep_order(evidence.get("config_signals") or [])[:20],
+        "dependencies": format_blueprint_dependencies(dependencies),
+        "implementation_notes": build_blueprint_notes(evidence, sql_items, dependencies),
+    }
+
+
+def build_blueprint_summary_rows(blueprint: dict) -> list[dict]:
+    return [
+        {"Area": "Pattern", "Value": blueprint["pattern"]},
+        {"Area": "Sources", "Value": join_or_dash(blueprint["source_tables"][:8])},
+        {"Area": "Targets", "Value": join_or_dash(blueprint["target_tables"][:8])},
+        {"Area": "Key fields", "Value": join_or_dash(blueprint["fields"][:12])},
+        {"Area": "Config signals", "Value": join_or_dash(blueprint["config_signals"][:8])},
+    ]
+
+
+def render_blueprint_list(label: str, values: list[str]) -> None:
+    st.write(f"**{label}:**")
+    if not values:
+        st.caption("None detected from current evidence.")
+        return
+    for value in values[:30]:
+        st.write(f"- `{value}`")
+
+
+def collect_blueprint_tables(sql_items: list[dict], source: bool) -> list[str]:
+    source_ops = {"SELECT", "WITH", "UNKNOWN", ""}
+    target_ops = {"INSERT", "UPDATE", "DELETE", "MERGE", "CREATE"}
+    tables = []
+    for item in sql_items:
+        operation = str(item.get("operation") or "").upper()
+        if source and operation in source_ops:
+            tables.extend(item.get("tables") or [])
+        elif not source and operation in target_ops:
+            tables.extend(item.get("tables") or [])
+    return dedupe_keep_order([table for table in tables if table])
+
+
+def collect_blueprint_fields(evidence: dict, sql_items: list[dict]) -> list[str]:
+    fields = []
+    for item in sql_items:
+        fields.extend(item.get("columns") or [])
+    fields.extend(evidence.get("context_refs") or [])
+    return dedupe_keep_order(
+        [
+            field
+            for field in fields
+            if field
+            and not is_noisy_catalog_field(field)
+            and not is_sql_keyword_catalog_field(field)
+        ]
+    )[:40]
+
+
+def format_blueprint_sql_operations(sql_items: list[dict]) -> list[str]:
+    operations = []
+    for item in sql_items[:20]:
+        operation = item.get("operation") or "SQL"
+        tables = ", ".join(item.get("tables") or [])
+        signature = item.get("signature") or ""
+        label = operation
+        if tables:
+            label += f" on {tables}"
+        if signature:
+            label += f": {signature[:140]}"
+        operations.append(label)
+    return operations
+
+
+def format_blueprint_dependencies(dependencies: list[dict]) -> list[str]:
+    labels = []
+    for dep in dependencies:
+        target = dep.get("target_job") or dep.get("target_id") or "unknown job"
+        component = dep.get("component") or "tRunJob"
+        labels.append(f"{component} -> {target}")
+    return labels[:20]
+
+
+def infer_blueprint_purpose(artifact, evidence: dict, source_tables: list[str], target_tables: list[str]) -> str:
+    if artifact.summary:
+        return artifact.summary
+    if source_tables and target_tables:
+        return f"Move or transform data from {join_or_dash(source_tables[:3])} to {join_or_dash(target_tables[:3])}."
+    if source_tables:
+        return f"Read and process data from {join_or_dash(source_tables[:3])}."
+    if evidence.get("urls"):
+        return f"Integrate with endpoint(s): {join_or_dash(evidence['urls'][:2])}."
+    return "Talend workflow derived from parsed job evidence."
+
+
+def infer_blueprint_pattern(components: list[str], sql_items: list[dict], dependencies: list[dict]) -> str:
+    component_text = " ".join(components).lower()
+    sql_ops = {str(item.get("operation") or "").upper() for item in sql_items}
+    if dependencies:
+        return "job orchestration"
+    if "tmap" in component_text and {"SELECT", "INSERT"} & sql_ops:
+        return "database transform/load"
+    if "fileinput" in component_text and "dboutput" in component_text:
+        return "file to database load"
+    if "dbinput" in component_text and "fileoutput" in component_text:
+        return "database export"
+    if "rest" in component_text or "http" in component_text:
+        return "API integration"
+    if sql_items:
+        return "SQL-driven data processing"
+    return "Talend component workflow"
+
+
+def build_blueprint_notes(evidence: dict, sql_items: list[dict], dependencies: list[dict]) -> list[str]:
+    notes = []
+    if evidence.get("database_technology"):
+        notes.append(f"Database technology detected: {evidence['database_technology']}")
+    if evidence.get("auth_signals"):
+        notes.append("Review authentication and secret handling before implementation.")
+    if dependencies:
+        notes.append("Preserve child-job orchestration or replace it with workflow dependencies.")
+    if sql_items:
+        notes.append("Validate SQL syntax, table names, and column mappings in the target runtime.")
+    if evidence.get("context_refs"):
+        notes.append("Parameterize environment-specific values using context/config variables.")
+    return notes or ["Review component configuration and schemas before implementation."]
+
+
+def format_blueprint_yaml(blueprint: dict) -> str:
+    lines = []
+    for key in [
+        "job_name",
+        "artifact_type",
+        "project",
+        "repo",
+        "purpose",
+        "pattern",
+        "source_tables",
+        "target_tables",
+        "fields",
+        "components",
+        "sql_operations",
+        "contexts",
+        "auth_signals",
+        "config_signals",
+        "dependencies",
+        "implementation_notes",
+    ]:
+        append_yaml_value(lines, key, blueprint.get(key))
+    return "\n".join(lines) + "\n"
+
+
+def append_yaml_value(lines: list[str], key: str, value) -> None:
+    if isinstance(value, list):
+        lines.append(f"{key}:")
+        if not value:
+            lines.append("  []")
+            return
+        for item in value:
+            lines.append(f"  - {yaml_scalar(item)}")
+        return
+    lines.append(f"{key}: {yaml_scalar(value)}")
+
+
+def yaml_scalar(value) -> str:
+    text = str(value or "")
+    escaped = text.replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
+
+
+def join_or_dash(values: list[str]) -> str:
+    return ", ".join(values) if values else "-"
+
+
+def safe_filename(value: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_.-]+", "_", str(value or "artifact")).strip("_") or "artifact"
+
     encoded = root.attrib.get("value", "").strip()
     if not encoded:
         return None
@@ -721,10 +960,11 @@ def render_maintenance_actions(artifact_type: str) -> None:
                     st.warning("No artifacts found in data/repos/")
                 else:
                     with SessionLocal() as db:
-                        inserted, skipped_existing = insert_artifacts(db, artifacts)
+                        inserted, updated, skipped_unchanged = insert_artifacts(db, artifacts)
 
                     st.success(
-                        f"Scan complete. Inserted: {inserted}, Already known: {skipped_existing}"
+                        "Scan complete. "
+                        f"Inserted: {inserted}, Updated: {updated}, Unchanged: {skipped_unchanged}"
                     )
 
             except Exception as e:

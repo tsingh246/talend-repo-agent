@@ -151,9 +151,10 @@ def dedupe_keep_order(values: list[str]) -> list[str]:
     return result
 
 
-def insert_artifacts(db: Session, artifacts: list[dict]) -> tuple[int, int]:
+def insert_artifacts(db: Session, artifacts: list[dict]) -> tuple[int, int, int]:
     inserted = 0
-    skipped_existing = 0
+    updated = 0
+    skipped_unchanged = 0
 
     for item in artifacts:
         existing = (
@@ -167,7 +168,11 @@ def insert_artifacts(db: Session, artifacts: list[dict]) -> tuple[int, int]:
         )
 
         if existing:
-            skipped_existing += 1
+            if artifact_source_unchanged(existing, item):
+                skipped_unchanged += 1
+                continue
+            refresh_existing_artifact_from_scan(existing, item)
+            updated += 1
             continue
 
         artifact = Artifact(**item)
@@ -175,7 +180,41 @@ def insert_artifacts(db: Session, artifacts: list[dict]) -> tuple[int, int]:
         inserted += 1
 
     db.commit()
-    return inserted, skipped_existing
+    return inserted, updated, skipped_unchanged
+
+
+def artifact_source_unchanged(existing: Artifact, item: dict) -> bool:
+    next_hash = item.get("source_hash")
+    if next_hash and existing.source_hash:
+        return existing.source_hash == next_hash
+    return (
+        existing.file_path == item.get("file_path")
+        and existing.source_modified_at == item.get("source_modified_at")
+    )
+
+
+def refresh_existing_artifact_from_scan(existing: Artifact, item: dict) -> None:
+    existing.artifact_id = item.get("artifact_id")
+    existing.artifact_type = item["artifact_type"]
+    existing.name = item["name"]
+    existing.repo_name = item["repo_name"]
+    existing.project_name = item.get("project_name")
+    existing.repo_path = item["repo_path"]
+    existing.file_path = item["file_path"]
+    existing.relative_path = item.get("relative_path")
+    existing.source_hash = item.get("source_hash")
+    existing.source_modified_at = item.get("source_modified_at")
+
+    existing.summary = "Discovered artifact changed; regenerate summaries."
+    existing.search_text = item.get("search_text", existing.name.lower())
+    existing.component_types = item.get("component_types", "")
+    existing.embedding_text = None
+    existing.embedding_vector = None
+    existing.embedding_hash = None
+    existing.embedding_model = None
+    existing.functional_hash = None
+    existing.connectivity_hash = None
+    existing.summary_status = "pending"
 
 
 def get_artifacts_for_summarization(db: Session) -> list[Artifact]:

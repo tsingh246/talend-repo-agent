@@ -1,12 +1,21 @@
 # Talend Repo Agent
 
-Talend Repo Agent is a Streamlit application for building a searchable knowledge base from Talend repositories. It scans Talend jobs, routines, joblets, schemas, SQL, dependency metadata, and vulnerability evidence so teams can answer questions like:
+Talend Repo Agent is a RAG-style knowledge base for Talend repositories. It ingests Talend jobs, routines, joblets, schemas, SQL, dependency metadata, screenshots, and vulnerability evidence, then turns that evidence into searchable context for retrieval, impact analysis, catalog exploration, and implementation-neutral ETL blueprints.
+
+The project is meant to showcase how a retrieval-augmented architecture can be built over legacy ETL assets:
+
+```text
+Talend files -> evidence extraction -> structured KB -> embeddings/search -> grounded answers and blueprints
+```
+
+Teams can ask questions like:
 
 - Which jobs use a table, column, component, endpoint, or credential pattern?
 - What fields look like customer, email, order, DOB, SSN, or other sensitive data?
 - Which Talend jobs call other jobs?
 - Which Maven dependencies or exported jars may have known vulnerabilities?
 - Why did a search result match: column name, table name, semantic meaning, evidence text, or component metadata?
+- What implementation-neutral blueprint can be derived from this Talend job?
 
 The application is designed as a local analysis tool. Source code is versioned, while scanned repositories, SQLite/Postgres data exports, vulnerability inputs, and secrets stay local.
 
@@ -17,6 +26,7 @@ The application is designed as a local analysis tool. Source code is versioned, 
   - Extracts job metadata, component types, SQL evidence, contexts, URLs, authentication/configuration signals, and job dependencies.
   - Supports text search and semantic search.
   - Can build pgvector embeddings for faster semantic retrieval.
+  - Tracks `.item` source hashes so unchanged artifacts can be skipped and changed artifacts can be marked stale for regeneration.
 
 - **Data Catalog**
   - Scans Talend metadata, SQL, context, and parameter evidence.
@@ -37,7 +47,93 @@ The application is designed as a local analysis tool. Source code is versioned, 
   - Deterministic local summaries are built from parsed evidence.
   - Optional OpenAI-based summaries can be enabled with environment variables.
 
-## Architecture
+- **ETL Blueprint Generation**
+  - Builds implementation-neutral job blueprints from parsed evidence.
+  - Summarizes purpose, pattern, source/target tables, fields, components, SQL operations, context variables, auth/config signals, dependencies, and implementation notes.
+  - Exports blueprint YAML from the artifact detail page.
+
+## RAG Architecture
+
+This project uses a RAG-oriented architecture rather than a model-training-first architecture.
+
+```text
+                 +-------------------------+
+                 | Talend Repositories     |
+                 | .item, routines, poms   |
+                 +------------+------------+
+                              |
+                              v
+                 +-------------------------+
+                 | Ingestion / Freshness   |
+                 | source_hash, mtime      |
+                 +------------+------------+
+                              |
+                              v
+                 +-------------------------+
+                 | Parsers / Scanners      |
+                 | components, SQL, schema |
+                 | context, deps, evidence |
+                 +------------+------------+
+                              |
+                              v
+                 +-------------------------+
+                 | Structured Knowledge DB |
+                 | Postgres + pgvector     |
+                 +------------+------------+
+                              |
+                  +-----------+------------+
+                  |                        |
+                  v                        v
+      +-----------------------+  +-----------------------+
+      | Keyword / Filter      |  | Semantic Retrieval    |
+      | SQLAlchemy search     |  | embeddings + pgvector |
+      +-----------+-----------+  +-----------+-----------+
+                  |                        |
+                  +-----------+------------+
+                              |
+                              v
+                 +-------------------------+
+                 | Grounded UI / Outputs   |
+                 | results, catalog,       |
+                 | lineage, blueprints     |
+                 +-------------------------+
+```
+
+### RAG Layers
+
+- **Document source layer**: Talend `.item` files, routine code, poms, screenshots, exported jobs, and jar folders.
+- **Freshness layer**: stores `source_hash` and `source_modified_at` for each artifact so unchanged `.item` files do not trigger unnecessary downstream work.
+- **Evidence layer**: extracts structured facts such as components, SQL operations, tables, columns, contexts, URLs, auth signals, dependencies, and routine references.
+- **Knowledge layer**: stores artifacts, catalog findings, vulnerability findings, summaries, and embedding metadata in Postgres.
+- **Retrieval layer**: combines keyword filters, semantic search, pgvector embeddings, catalog grouping, and match-reason labeling.
+- **Grounding layer**: every displayed summary, catalog hit, vulnerability row, and blueprint is derived from stored evidence.
+- **Agent/output layer**: generates ETL blueprints and YAML from retrieved evidence. This is intentionally implementation-neutral before attempting any code or Talend XML generation.
+
+### When To Update The RAG Index
+
+The repository scan follows a file-freshness policy for Talend `.item` files:
+
+```text
+New .item file
+  -> insert artifact
+  -> summary_status = pending
+  -> needs summary and embedding
+
+Existing .item file with same source_hash
+  -> skip
+  -> keep current summary, catalog evidence, and embeddings
+
+Existing .item file with changed source_hash
+  -> update artifact metadata
+  -> reset functional/connectivity hashes
+  -> clear embedding text/vector/hash/model
+  -> summary_status = pending
+  -> downstream summary and embedding rebuild required
+```
+
+This is the key operational rule for the RAG demo: **only changed Talend artifacts should invalidate derived context.**
+
+## Project Architecture
 
 ```text
 talend-repo-agent/
@@ -55,7 +151,7 @@ talend-repo-agent/
   requirements.txt                 Python dependencies
 ```
 
-### Data Flow
+### Application Data Flow
 
 ```text
 Talend repo files / exported jobs / jars
@@ -64,18 +160,18 @@ Talend repo files / exported jobs / jars
 Parsers and scanners
         |
         v
-Structured evidence
+Structured evidence and source fingerprints
         |
         v
-Postgres tables
+Postgres tables + optional pgvector embeddings
         |
         v
-Streamlit UI: KB search, catalog, vulnerability results
+Streamlit UI: KB search, catalog, vulnerability results, blueprints
 ```
 
 ### Main Tables
 
-- `artifacts`: scanned jobs, routines, joblets, summaries, search text, dependency evidence, embeddings.
+- `artifacts`: scanned jobs, routines, joblets, source hashes, summaries, search text, dependency evidence, embeddings.
 - `catalog_findings`: field/table/semantic/evidence findings for the data catalog.
 - `catalog_scans`: catalog scan history.
 - `vulnerability_findings`: dependency vulnerability findings.
@@ -163,8 +259,10 @@ exports/                  CSV/JSON scan outputs
 1. Put Talend repository content under `data/repos`.
 2. Open the app.
 3. Use **Scan Local Repositories** from the Knowledge Base page.
-4. Generate summaries if needed.
-5. Search by job name, component, table, URL, auth signal, context variable, SQL evidence, or semantic content.
+4. Review the scan result: inserted, updated, unchanged.
+5. Generate summaries if needed.
+6. Search by job name, component, table, URL, auth signal, context variable, SQL evidence, or semantic content.
+7. Open an artifact detail page to review evidence, job preview, dependencies, and the generated ETL blueprint.
 
 ### Data Catalog
 
@@ -256,6 +354,7 @@ The current `.gitignore` excludes local secrets and scan data:
 ```text
 .env
 data/
+exports/
 ```
 
 ## Development Notes

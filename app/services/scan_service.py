@@ -1,3 +1,5 @@
+import hashlib
+from datetime import datetime
 from pathlib import Path
 from typing import List, Dict
 
@@ -47,6 +49,8 @@ def scan_repositories() -> List[Dict]:
                         "summary": "Discovered artifact (not parsed yet)",
                         "search_text": file_path.stem.lower(),
                         "component_types": "",
+                        "source_hash": compute_file_hash(file_path),
+                        "source_modified_at": datetime.fromtimestamp(file_path.stat().st_mtime),
                     }
                 )
 
@@ -59,3 +63,11 @@ def classify_artifact(relative_path: str) -> str | None:
     if relative_path.startswith("code/routines/"):
         return "routine"
     return None
+
+
+def compute_file_hash(path: Path) -> str:
+    hasher = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            hasher.update(chunk)
+    return hasher.hexdigest()

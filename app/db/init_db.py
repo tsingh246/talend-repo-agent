@@ -58,6 +58,10 @@ def ensure_artifact_change_detection_columns() -> None:
         statements.append("ALTER TABLE artifacts ADD COLUMN job_dependencies TEXT")
     if "evidence_json" not in columns:
         statements.append("ALTER TABLE artifacts ADD COLUMN evidence_json TEXT")
+    if "source_hash" not in columns:
+        statements.append("ALTER TABLE artifacts ADD COLUMN source_hash TEXT")
+    if "source_modified_at" not in columns:
+        statements.append("ALTER TABLE artifacts ADD COLUMN source_modified_at TIMESTAMP")
 
     if not statements:
         return

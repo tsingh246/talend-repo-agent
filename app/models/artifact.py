@@ -27,6 +27,8 @@ class Artifact(Base):
     repo_path: Mapped[str] = mapped_column(Text, nullable=False)
     file_path: Mapped[str] = mapped_column(Text, nullable=False)
     relative_path: Mapped[str] = mapped_column(Text, nullable=True)
+    source_hash: Mapped[str] = mapped_column(Text, nullable=True)
+    source_modified_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
     summary: Mapped[str] = mapped_column(Text, nullable=True)
     search_text: Mapped[str] = mapped_column(Text, nullable=True)
