@@ -1,5 +1,4 @@
 from __future__ import annotations
-
 import html
 import re
 import xml.etree.ElementTree as ET
@@ -7,19 +6,14 @@ from pathlib import Path
 from typing import Any
 
 
-URL_REGEX = re.compile(r"https?://[^\s\"'<>]+", re.IGNORECASE)
+URL_REGEX = re.compile(r"https?://[^\s\"'<>\\&]+", re.IGNORECASE)
 CONTEXT_REGEX = re.compile(r"context\.[A-Za-z0-9_]+")
-SQL_REGEX = re.compile(r"\b(select|insert|update|delete)\b", re.IGNORECASE)
-SQL_STATEMENT_REGEX = re.compile(
-    r"\bselect\b[\s\S]{0,2000}?\bfrom\b|\binsert\b\s+into\b|\bupdate\b[\s\S]{0,500}?\bset\b|\bdelete\b\s+from\b|\bmerge\b\s+into\b",
-    re.IGNORECASE,
-)
+SQL_REGEX = re.compile(r"\b(select|insert|update|delete|merge)\b", re.IGNORECASE)
 
 JAVA_METHOD_REGEX = re.compile(
     r"(?:public|private|protected)?\s*(?:static\s+)?[\w<>\[\]]+\s+([A-Za-z_][A-Za-z0-9_]*)\s*\((.*?)\)",
     re.DOTALL,
 )
-
 JAVA_CLASS_REGEX = re.compile(r"\bclass\s+([A-Za-z_][A-Za-z0-9_]*)\b")
 JAVA_IMPORT_REGEX = re.compile(r"import\s+([A-Za-z0-9_.*]+);")
 JAVA_QUALIFIED_REF_REGEX = re.compile(r"\b(?:[a-z_][a-z0-9_]*\.)+[A-Z][A-Za-z0-9_]*\b")
@@ -27,33 +21,44 @@ JAVA_STRING_LITERAL_REGEX = re.compile(r'"([^"]{3,300})"')
 JAVA_PARAM_NAME_REGEX = re.compile(r"(?:final\s+)?[\w<>\[\].]+\s+([A-Za-z_][A-Za-z0-9_]*)\s*$")
 
 COMPONENT_REGEX = re.compile(r"^(t[A-Z][A-Za-z0-9]*)(?:_\d+)?$")
-DB_INPUT_COMPONENT_REGEX = re.compile(
-    r"^t(?:DB|Jdbc|Oracle|Mysql|Postgresql|MSSql|Snowflake|Netezza|Teradata)[A-Za-z0-9]*Input$",
-    re.IGNORECASE,
-)
+
+SQL_PROPERTY_KEYS = {
+    "query",
+    "sql",
+    "dbquery",
+    "elt_query",
+    "querystore",
+}
+
+TABLE_PROPERTY_KEYS = {
+    "table",
+    "table_name",
+    "tablename",
+}
 
 
 def parse_item_file(file_path: str, artifact_type: str) -> dict[str, Any]:
     path = Path(file_path)
 
     empty_result = {
-        "name": path.stem,
         "component_types": [],
         "labels": [],
         "urls": [],
         "context_refs": [],
         "sql_snippets": [],
+        "sql_evidence": [],
         "text_samples": [],
         "code_snippets": [],
         "method_names": [],
         "imports": [],
         "string_literals": [],
         "code_keywords": [],
+        "config_signals": [],
         "auth_signals": [],
-        "external_systems": [],
         "class_names": [],
         "parameter_names": [],
         "qualified_class_refs": [],
+        "job_dependencies": [],
     }
 
     if not path.exists():
@@ -68,9 +73,9 @@ def parse_item_file(file_path: str, artifact_type: str) -> dict[str, Any]:
     component_types: list[str] = []
     labels: list[str] = []
     code_snippets: list[str] = []
-    db_input_sql_snippets: list[str] = []
+    sql_evidence: list[dict] = []
+    job_dependencies: list[dict] = []
 
-    # Try XML parse, but do NOT exit if it fails
     root = None
     try:
         tree = ET.parse(path)
@@ -78,10 +83,7 @@ def parse_item_file(file_path: str, artifact_type: str) -> dict[str, Any]:
     except Exception:
         root = None
 
-    # XML-backed artifacts
     if root is not None:
-        db_input_sql_snippets = extract_db_input_sql_from_xml(root)
-
         for elem in root.iter():
             for value in elem.attrib.values():
                 if value and isinstance(value, str):
@@ -111,11 +113,17 @@ def parse_item_file(file_path: str, artifact_type: str) -> dict[str, Any]:
                 if lower_key in {"label", "displayname", "name"} and value:
                     labels.append(str(value).strip())
 
-    # Always inspect raw text for routines. For jobs/joblets we rely on XML values
-    # to avoid adding noisy full-document snippets into search signals.
+        sql_evidence = extract_sql_evidence_from_xml(root)
+        job_dependencies = extract_t_run_job_dependencies(root)
+
+    # Always inspect raw text
     if raw_text:
+        all_text_values.append(raw_text)
+
+        # For routines, raw text is source of truth even if XML parsing fails
         if artifact_type == "routine":
-            all_text_values.append(raw_text)
+            code_snippets.append(clean_snippet(raw_text, max_len=3000))
+        elif looks_like_code(raw_text):
             code_snippets.append(clean_snippet(raw_text, max_len=3000))
 
     all_text_values = dedupe_keep_order([x for x in all_text_values if x])
@@ -126,15 +134,9 @@ def parse_item_file(file_path: str, artifact_type: str) -> dict[str, Any]:
     urls = extract_urls(all_text_values)
     context_refs = extract_context_refs(all_text_values)
     sql_snippets = extract_sql_snippets(all_text_values)
-    sql_snippets = dedupe_keep_order(db_input_sql_snippets + sql_snippets)
     text_samples = pick_interesting_text_samples(all_text_values)
-    auth_signals = extract_auth_signals(all_text_values, urls, component_types)
-    external_systems = extract_external_systems(
-        urls=urls,
-        component_types=component_types,
-        sql_snippets=sql_snippets,
-        code_snippets=code_snippets,
-    )
+    config_signals = extract_config_signals(all_text_values + code_snippets + urls + context_refs)
+    auth_signals = extract_auth_signals(all_text_values + code_snippets + urls + context_refs)
 
     method_names: list[str] = []
     imports: list[str] = []
@@ -144,8 +146,13 @@ def parse_item_file(file_path: str, artifact_type: str) -> dict[str, Any]:
     parameter_names: list[str] = []
     qualified_class_refs: list[str] = []
 
+    source_for_keywords = redact_sensitive_values(
+        "\n".join(all_text_values + code_snippets + config_signals + auth_signals)
+    )
+
     if artifact_type == "routine":
-        routine_source = "\n".join(all_text_values + code_snippets)
+        routine_source = source_for_keywords
+
         class_names = extract_class_names(routine_source)
         method_names, parameter_names = extract_methods_and_params(routine_source)
         imports = extract_imports(routine_source)
@@ -159,26 +166,37 @@ def parse_item_file(file_path: str, artifact_type: str) -> dict[str, Any]:
             qualified_class_refs=qualified_class_refs,
             string_literals=string_literals,
         )
+    else:
+        code_keywords = extract_code_keywords(
+            source_for_keywords,
+            class_names=[],
+            method_names=[],
+            parameter_names=[],
+            qualified_class_refs=[],
+            string_literals=[],
+        )
 
     return {
-        "name": path.stem,
         "component_types": component_types[:30],
         "labels": labels[:30],
         "urls": urls[:20],
         "context_refs": context_refs[:30],
         "sql_snippets": sql_snippets[:10],
+        "sql_evidence": sql_evidence[:20],
         "text_samples": text_samples[:20],
         "code_snippets": code_snippets[:10],
         "method_names": method_names[:20],
         "imports": imports[:20],
         "string_literals": string_literals[:20],
         "code_keywords": code_keywords[:30],
-        "auth_signals": auth_signals[:20],
-        "external_systems": external_systems[:20],
+        "config_signals": config_signals[:30],
+        "auth_signals": auth_signals[:30],
         "class_names": class_names[:10],
         "parameter_names": parameter_names[:30],
         "qualified_class_refs": qualified_class_refs[:30],
+        "job_dependencies": job_dependencies[:50],
     }
+
 
 def normalize_component_name(value: str) -> str | None:
     value = value.strip()
@@ -208,34 +226,42 @@ def looks_like_code(text: str) -> bool:
         "static ",
         "new ",
         "com.amazonaws",
+        ";",
     ]
-    hit_count = sum(1 for token in indicators if token in sample)
-    return hit_count >= 2
+    return any(token in sample for token in indicators)
 
 
 def clean_snippet(text: str, max_len: int = 500) -> str:
-    cleaned = " ".join(text.strip().split())
+    cleaned = " ".join(redact_sensitive_values(text).strip().split())
     return cleaned[:max_len]
 
 
 def extract_urls(text_values: list[str]) -> list[str]:
+    ignored_domains = [
+        "www.omg.org",
+        "www.w3.org",
+        "www.talend.org",
+    ]
+
     results: list[str] = []
+
     for value in text_values:
-        for candidate in URL_REGEX.findall(value):
-            if is_informative_url(candidate):
-                results.append(candidate)
+        for url in URL_REGEX.findall(value):
+            cleaned_url = clean_extracted_url(url)
+            lower = cleaned_url.lower()
+            if any(domain in lower for domain in ignored_domains):
+                continue
+            results.append(cleaned_url)
+
     return dedupe_keep_order(results)
 
 
-def is_informative_url(url: str) -> bool:
-    lower = url.lower()
-    ignored_markers = [
-        "omg.org",
-        "eclipse.org",
-        "talend.org",
-    ]
-    return not any(marker in lower for marker in ignored_markers)
-
+def clean_extracted_url(url: str) -> str:
+    cleaned = html.unescape(url).strip()
+    for marker in ['"', "'", "<", ">", "\\", "&quot;", "&#xA;"]:
+        if marker in cleaned:
+            cleaned = cleaned.split(marker, 1)[0]
+    return cleaned.rstrip(".,;)")
 
 def extract_context_refs(text_values: list[str]) -> list[str]:
     results: list[str] = []
@@ -247,179 +273,217 @@ def extract_context_refs(text_values: list[str]) -> list[str]:
 def extract_sql_snippets(text_values: list[str]) -> list[str]:
     results: list[str] = []
     for value in text_values:
-        if looks_like_sql_statement(value):
-            snippet = normalize_sql_snippet(value, max_len=400)
-            if is_valid_sql_snippet(snippet):
-                results.append(snippet)
+        if SQL_REGEX.search(value):
+            results.append(clean_sql(value, max_len=400))
     return dedupe_keep_order(results)
 
 
-def extract_auth_signals(
-    text_values: list[str],
-    urls: list[str],
-    component_types: list[str],
-) -> list[str]:
-    corpus = " ".join(text_values + urls).lower()
-    markers = {
-        "oauth": [
-            r"\boauth\b",
-            r"oauth2",
-            r"/services/oauth2",
-            r"grant[_-]?type",
-            r"access[_-]?token",
-        ],
-        "bearer_token": [r"\bbearer\b", r"authorization:\s*bearer", r"x-auth-token"],
-        "basic_auth": [r"\bbasic auth\b", r"authorization:\s*basic"],
-        "vault_secret": [r"\bvault\b", r"hashicorp", r"x-vault-token", r"/v1/secret", r"/v1/kv"],
-        "api_key": [r"\bapi[_-]?key\b", r"x-api-key"],
-    }
-    results: list[str] = []
-    for signal, patterns in markers.items():
-        if any(re.search(pattern, corpus, re.IGNORECASE) for pattern in patterns):
-            results.append(signal)
-
-    # Salesforce connector jobs commonly use OAuth even if endpoint strings are sparse.
-    if (
-        "oauth" not in results
-        and any(c.startswith("tSalesforce") for c in component_types)
-    ):
-        results.append("oauth")
-    return dedupe_keep_order(results)
-
-
-def extract_external_systems(
-    urls: list[str],
-    component_types: list[str],
-    sql_snippets: list[str],
-    code_snippets: list[str],
-) -> list[str]:
-    url_blob = " ".join(urls).lower()
-    sql_blob = " ".join(sql_snippets).lower()
-    code_blob = " ".join(code_snippets).lower()
-    results: list[str] = []
-
-    if any(c.startswith("tSnowflake") for c in component_types) or "snowflake" in url_blob or "snowflake" in sql_blob:
-        results.append("snowflake")
-
-    if (
-        any(c.startswith("tOracle") for c in component_types)
-        or "jdbc:oracle:" in sql_blob
-        or "jdbc:oracle:" in code_blob
-    ):
-        results.append("oracle")
-
-    if any(c.startswith("tSalesforce") for c in component_types) or "salesforce" in url_blob:
-        results.append("salesforce")
-
-    if "hashicorp" in code_blob or "vault" in code_blob or "/v1/secret" in url_blob:
-        results.append("hashicorp_vault")
-
-    if (
-        any(c.startswith("tS3") for c in component_types)
-        or "amazonaws.com" in url_blob
-        or re.search(r"\baws\b", code_blob) is not None
-    ):
-        results.append("aws")
-
-    if "servicenow" in url_blob or "servicenow" in code_blob:
-        results.append("servicenow")
-
-    return dedupe_keep_order(results)
-
-
-def extract_db_input_sql_from_xml(root: ET.Element) -> list[str]:
-    results: list[str] = []
+def extract_sql_evidence_from_xml(root) -> list[dict]:
+    sql_items: list[dict] = []
 
     for elem in root.iter():
-        component_name = ""
-        for key, value in elem.attrib.items():
-            if key.lower() in {"componentname", "component_name", "type", "name"} and isinstance(value, str):
-                normalized = normalize_component_name(value.strip())
-                if normalized:
-                    component_name = normalized
-                    break
+        elem_attrs = {k.lower(): v for k, v in elem.attrib.items()}
 
-        if not component_name or not DB_INPUT_COMPONENT_REGEX.match(component_name):
+        component_name = (
+            elem_attrs.get("componentname")
+            or elem_attrs.get("component_name")
+            or elem_attrs.get("name")
+            or ""
+        )
+
+        for key, value in elem.attrib.items():
+            key_l = key.lower()
+
+            if not isinstance(value, str):
+                continue
+
+            clean_value = value.strip()
+            if not clean_value:
+                continue
+
+            if key_l in SQL_PROPERTY_KEYS or looks_like_sql(clean_value):
+                sql_items.append(
+                    {
+                        "component": component_name,
+                        "property": key,
+                        "operation": detect_sql_operation(clean_value),
+                        "tables": extract_sql_tables(clean_value),
+                        "sql": clean_sql(clean_value),
+                        "signature": build_sql_signature(clean_value),
+                    }
+                )
+
+    return dedupe_sql_evidence(sql_items)
+
+
+def extract_t_run_job_dependencies(root) -> list[dict]:
+    dependencies: list[dict] = []
+
+    for node in root.iter():
+        if node.attrib.get("componentName") != "tRunJob":
             continue
 
-        for node in elem.iter():
-            attr_name = str(
-                node.attrib.get("name")
-                or node.attrib.get("field")
-                or node.attrib.get("key")
-                or ""
-            ).strip().lower()
+        params = {}
+        for child in node:
+            if child.tag.split("}")[-1] != "elementParameter":
+                continue
+            name = child.attrib.get("name")
+            if name:
+                params[name] = child.attrib.get("value", "")
 
-            candidate_values: list[str] = []
-            for attr_key, attr_value in node.attrib.items():
-                if not isinstance(attr_value, str):
-                    continue
-                if attr_key.lower() in {"value", "defaultvalue", "rawvalue", "expression"}:
-                    candidate_values.append(attr_value)
+        technical_ref = params.get("PROCESS:PROCESS_TYPE_PROCESS", "")
+        target_project = ""
+        target_id = technical_ref
+        if ":" in technical_ref:
+            target_project, target_id = technical_ref.split(":", 1)
 
-            if node.text and isinstance(node.text, str):
-                candidate_values.append(node.text)
+        dependency = {
+            "component": params.get("UNIQUE_NAME", ""),
+            "target_job": params.get("PROCESS", ""),
+            "target_project": target_project,
+            "target_id": target_id,
+            "context": params.get("PROCESS:PROCESS_TYPE_CONTEXT", ""),
+            "version": params.get("PROCESS:PROCESS_TYPE_VERSION", ""),
+            "dynamic": params.get("USE_DYNAMIC_JOB", ""),
+            "independent_process": params.get("USE_INDEPENDENT_PROCESS", ""),
+        }
 
-            for candidate in candidate_values:
-                text = normalize_memo_sql_value(candidate)
-                if not text:
-                    continue
-                if (
-                    attr_name in {"query", "sql", "statement", "querystring", "query_text"}
-                    or "query" in attr_name
-                    or "sql" in attr_name
-                    or looks_like_sql_statement(text)
-                ):
-                    if looks_like_sql_statement(text):
-                        snippet = normalize_sql_snippet(text, max_len=700)
-                        if is_valid_sql_snippet(snippet):
-                            results.append(snippet)
+        if dependency["target_job"] or dependency["target_id"]:
+            dependencies.append(dependency)
 
-    return dedupe_keep_order(results)
+    return dedupe_dependencies(dependencies)
 
 
-def looks_like_sql_statement(text: str) -> bool:
-    sample = " ".join(text.split())
-    return bool(SQL_STATEMENT_REGEX.search(sample))
+def dedupe_dependencies(items: list[dict]) -> list[dict]:
+    seen = set()
+    result = []
+    for item in items:
+        key = (
+            item.get("component", ""),
+            item.get("target_job", ""),
+            item.get("target_project", ""),
+            item.get("target_id", ""),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(item)
+    return result
+
+def looks_like_sql(value: str) -> bool:
+    v = clean_sql(value).lower().strip()
+
+    return (
+        v.startswith("select ")
+        or v.startswith("insert ")
+        or v.startswith("update ")
+        or v.startswith("delete ")
+        or v.startswith("merge ")
+        or " from " in v
+        or " join " in v
+        or " where " in v
+        or " group by " in v
+    )
 
 
-def normalize_memo_sql_value(raw_value: str) -> str:
-    text = html.unescape(raw_value).strip()
-    text = text.replace("\\r\\n", "\n").replace("\\n", "\n").replace("\\r", "\n")
-    text = text.replace("\r\n", "\n").replace("\r", "\n")
+def detect_sql_operation(sql: str) -> str:
+    s = clean_sql(sql).lower().strip()
 
-    # Talend MEMO_SQL values are often wrapped in extra quotes.
-    if len(text) >= 2 and text[0] == text[-1] and text[0] in {'"', "'"}:
-        text = text[1:-1].strip()
+    for op in ["select", "insert", "update", "delete", "merge"]:
+        if s.startswith(op):
+            return op.upper()
 
-    return text
+    return "SQL"
+
+def build_database_keywords(component_types: list[str]) -> list[str]:
+    db_tech = detect_database_technology(component_types)
+    if not db_tech:
+        return []
+
+    return [
+        f"database_type:{db_tech}",
+        db_tech,
+        db_tech.lower(),
+    ]
+
+def clean_sql(sql: str, max_len: int = 5000) -> str:
+    decoded = html.unescape(sql).strip()
+
+    # Remove wrapping quotes from Talend XML values
+    if len(decoded) >= 2 and decoded[0] == '"' and decoded[-1] == '"':
+        decoded = decoded[1:-1]
+
+    # 🔥 Remove SQL comments
+
+    # Remove multi-line comments /* ... */
+    decoded = re.sub(r"/\*.*?\*/", " ", decoded, flags=re.DOTALL)
+
+    # Remove single-line comments -- ...
+    decoded = re.sub(r"--.*?(?=\n|$)", " ", decoded)
+
+    # Normalize whitespace
+    cleaned = " ".join(
+        decoded.replace("\r", " ").replace("\n", " ").replace("\t", " ").split()
+    )
+    cleaned = redact_sensitive_values(cleaned)
+
+    return cleaned[:max_len]
 
 
-def normalize_sql_snippet(text: str, max_len: int) -> str:
-    snippet = clean_snippet(text, max_len=max_len)
-    return snippet.strip().strip('"').strip("'")
+def redact_sensitive_values(text: str) -> str:
+    redacted = re.sub(
+        r"enc:system\.encryption\.key\.v1:[A-Za-z0-9+/=]+",
+        "enc:system.encryption.key.v1:[REDACTED]",
+        text,
+        flags=re.IGNORECASE,
+    )
+    redacted = re.sub(
+        r"((?:password|pwd|secret|token|private_key_file_pwd|securitykey)\s*[=:]\s*)[^&\s\"']+",
+        r"\1[REDACTED]",
+        redacted,
+        flags=re.IGNORECASE,
+    )
+    return redacted
+def build_sql_signature(sql: str, max_len: int = 500) -> str:
+    cleaned = clean_sql(sql).lower()
+    cleaned = re.sub(r"[^a-z0-9_.$]+", " ", cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return cleaned[:max_len]
+
+def extract_sql_tables(sql: str) -> list[str]:
+    cleaned = clean_sql(sql)
+
+    table_patterns = [
+        r"\bfrom\s+([A-Za-z0-9_.$]+)",
+        r"\bjoin\s+([A-Za-z0-9_.$]+)",
+        r"\binto\s+([A-Za-z0-9_.$]+)",
+        r"\bupdate\s+([A-Za-z0-9_.$]+)",
+    ]
+
+    tables: list[str] = []
+    for pattern in table_patterns:
+        for match in re.finditer(pattern, cleaned, re.IGNORECASE):
+            tables.append(match.group(1))
+
+    return dedupe_keep_order(tables)
 
 
-def is_valid_sql_snippet(snippet: str) -> bool:
-    if len(snippet) < 20:
-        return False
-    # Ignore broken fragments such as SELECT ' ... with unmatched quotes.
-    if snippet.count("'") % 2 != 0:
-        return False
-    if snippet.count('"') % 2 != 0:
-        return False
-    lower = snippet.lower()
-    if "select" in lower and "from" not in lower:
-        return False
-    if "insert" in lower and "into" not in lower:
-        return False
-    if "update" in lower and " set " not in f" {lower} ":
-        return False
-    if "delete" in lower and "from" not in lower:
-        return False
-    if "merge" in lower and "into" not in lower:
-        return False
-    return True
+def dedupe_sql_evidence(items: list[dict]) -> list[dict]:
+    seen = set()
+    result = []
+
+    for item in items:
+        signature = item.get("signature", "")
+        if not signature:
+            continue
+
+        if signature in seen:
+            continue
+
+        seen.add(signature)
+        result.append(item)
+
+    return result
 
 
 def extract_class_names(source: str) -> list[str]:
@@ -457,7 +521,9 @@ def extract_qualified_class_refs(source: str) -> list[str]:
 
 
 def extract_string_literals(source: str) -> list[str]:
-    return dedupe_keep_order([x.strip() for x in JAVA_STRING_LITERAL_REGEX.findall(source) if x.strip()])
+    return dedupe_keep_order(
+        [x.strip() for x in JAVA_STRING_LITERAL_REGEX.findall(source) if x.strip()]
+    )
 
 
 def extract_code_keywords(
@@ -469,6 +535,7 @@ def extract_code_keywords(
     string_literals: list[str],
 ) -> list[str]:
     keyword_candidates = [
+        "hashicorp",
         "vault",
         "token",
         "secret",
@@ -496,6 +563,11 @@ def extract_code_keywords(
         "amazon",
         "credential",
         "url",
+        "sftp",
+        "ssh",
+        "private_key",
+        "privatekey",
+        "keypair",
     ]
 
     found: list[str] = []
@@ -515,25 +587,101 @@ def extract_code_keywords(
     return dedupe_keep_order(found)
 
 
+def extract_config_signals(text_values: list[str]) -> list[str]:
+    blob = " ".join(redact_sensitive_values(str(value)) for value in text_values).lower()
+    signals: list[str] = []
+
+    if "hashicorp" in blob or "vault" in blob or "bettercloud.vault" in blob:
+        signals.extend(
+            [
+                "HashiCorp Vault",
+                "vault",
+                "hashicorp",
+                "secret management",
+            ]
+        )
+
+    if "vault_aws_role" in blob or "talendvaultauthfactory" in blob or "authenticatevault" in blob:
+        signals.append("Vault AWS IAM authentication")
+
+    if "sftp" in blob:
+        signals.extend(["SFTP", "SSH file transfer"])
+
+    if "tssh" in blob:
+        signals.append("Talend SSH component")
+
+    if (
+        "privatekey" in blob
+        or "private_key_file" in blob
+        or "private_key_base64" in blob
+        or "/.ssh/" in blob
+        or "ssh-rsa" in blob
+        or "openssh" in blob
+    ):
+        signals.extend(["SSH private key", "SSH key pair", "key-pair authentication"])
+
+    if "snowflake_jwt" in blob or ("snowflake" in blob and "private_key" in blob):
+        signals.extend(
+            [
+                "Snowflake JWT key-pair authentication",
+                "snowflake key pair",
+                "snowflake private key",
+            ]
+        )
+
+    if "oauth" in blob:
+        signals.append("OAuth authentication")
+    if "basic" in blob and ("auth" in blob or "login" in blob):
+        signals.append("Basic authentication")
+
+    return dedupe_keep_order(signals)
+
+
+def extract_auth_signals(text_values: list[str]) -> list[str]:
+    blob = " ".join(redact_sensitive_values(str(value)) for value in text_values).lower()
+    signals: list[str] = []
+
+    auth_map = [
+        ("HashiCorp Vault authentication", ["hashicorp", "vault"]),
+        ("Vault AWS IAM authentication", ["vault_aws_role", "authenticatevault"]),
+        ("SFTP/SSH authentication", ["sftp", "ssh-rsa", "openssh", "/.ssh/"]),
+        ("Private key authentication", ["privatekey", "private_key_file", "private_key_base64"]),
+        ("Snowflake JWT key-pair authentication", ["snowflake_jwt"]),
+        ("OAuth authentication", ["oauth"]),
+        ("Token authentication", ["token"]),
+    ]
+
+    for label, markers in auth_map:
+        if any(marker in blob for marker in markers):
+            signals.append(label)
+
+    return dedupe_keep_order(signals)
+
+
 def pick_interesting_text_samples(text_values: list[str]) -> list[str]:
     samples: list[str] = []
     for value in text_values:
-        v = value.strip()
+        v = redact_sensitive_values(value).strip()
+
         if len(v) < 6:
             continue
         if len(v) > 250:
             continue
         if v.startswith("{") and v.endswith("}"):
             continue
+
         samples.append(v)
+
     return dedupe_keep_order(samples)
 
 
 def dedupe_keep_order(values: list[str]) -> list[str]:
     seen = set()
     result = []
+
     for value in values:
         if value not in seen:
             seen.add(value)
             result.append(value)
+
     return result

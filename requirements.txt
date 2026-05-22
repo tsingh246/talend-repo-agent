@@ -1,0 +1,10 @@
+streamlit
+sqlalchemy
+psycopg2-binary
+python-dotenv
+scikit-learn
+numpy
+sentence-transformers
+pgvector
+torchvision
+openai
