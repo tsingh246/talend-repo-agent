@@ -102,16 +102,95 @@ This project uses a RAG-oriented architecture rather than a model-training-first
 ### RAG Layers
 
 - **Document source layer**: Talend `.item` files, routine code, poms, screenshots, exported jobs, and jar folders.
-- **Freshness layer**: stores `source_hash` and `source_modified_at` for each artifact so unchanged `.item` files do not trigger unnecessary downstream work.
+- **Freshness layer**: stores a semantic `source_hash` and `source_modified_at` for each artifact so unchanged `.item` behavior does not trigger unnecessary downstream work.
 - **Evidence layer**: extracts structured facts such as components, SQL operations, tables, columns, contexts, URLs, auth signals, dependencies, and routine references.
 - **Knowledge layer**: stores artifacts, catalog findings, vulnerability findings, summaries, and embedding metadata in Postgres.
 - **Retrieval layer**: combines keyword filters, semantic search, pgvector embeddings, catalog grouping, and match-reason labeling.
 - **Grounding layer**: every displayed summary, catalog hit, vulnerability row, and blueprint is derived from stored evidence.
 - **Agent/output layer**: generates ETL blueprints and YAML from retrieved evidence. This is intentionally implementation-neutral before attempting any code or Talend XML generation.
 
+### Retrieval
+
+Retrieval finds the most relevant Talend evidence for a user question or workflow.
+
+The project currently supports several retrieval paths:
+
+- **Keyword retrieval**: SQLAlchemy search over artifact names, summaries, component types, file paths, dependency evidence, and parsed evidence JSON.
+- **Semantic retrieval**: optional embedding generation with local sentence-transformers or OpenAI embeddings, persisted in Postgres/pgvector.
+- **Catalog retrieval**: table, column, meaning, evidence type, and match-type search over `catalog_findings`.
+- **Filter retrieval**: project, artifact type, component, database, auth signal, config signal, SQL presence, REST/API presence, secret/key-material signal, and dependency filters.
+- **Graph-style retrieval**: parent/child job dependency lookup for jobs connected through `tRunJob`.
+- **Vulnerability retrieval**: dependency and advisory findings linked back to KB artifacts.
+
+Retrieval results include match explanations where possible:
+
+```text
+Exact column name match - customer
+Column name contains - customer_id
+Exact table name match - customer
+Evidence text match
+Component match
+```
+
+This makes retrieved context auditable instead of opaque.
+
+### Augmentation
+
+Augmentation enriches retrieved artifacts with structured context before display or generation.
+
+The system augments retrieved Talend jobs with:
+
+- job metadata: project, repo, file path, artifact type
+- component evidence: component names and component families
+- SQL evidence: operations, signatures, tables, and columns
+- catalog evidence: detected fields, SQL keywords, semantic meaning, source type, direction, confidence, and best evidence
+- connectivity evidence: URLs, context variables, database technology, auth/config signals
+- dependency evidence: parent jobs, child jobs, and unresolved job references
+- vulnerability evidence: package, version, advisory, severity, and recommended fix
+- visual evidence: job screenshot preview when a `.screenshot` file is available
+
+This augmented context is what makes downstream outputs grounded. The app does not simply answer from a model's memory; it answers from parsed Talend evidence stored in the KB.
+
+### Generation
+
+Generation is intentionally limited and evidence-grounded.
+
+Current generated outputs include:
+
+- deterministic artifact summaries
+- optional LLM summaries when explicitly enabled
+- catalog match explanations
+- vulnerability summaries
+- ETL Blueprint YAML
+
+The ETL Blueprint is the clearest RAG-style generated artifact. It is created from retrieved and parsed evidence and includes purpose, inferred pattern, source/target tables, fields, components, SQL operations, context variables, auth/config signals, child job dependencies, and implementation notes.
+
+### Grounding And Traceability
+
+Every major output should be traceable back to source evidence:
+
+- Search result -> artifact path and match reason
+- Catalog row -> component, table/column, evidence type, confidence, and best evidence
+- Vulnerability result -> package/version/advisory source
+- Blueprint -> parsed SQL, components, contexts, dependencies, and config/auth signals
+
+This is important for a RAG showcase because trust comes from showing **why** something was retrieved and **what evidence** was used.
+
 ### When To Update The RAG Index
 
-The repository scan follows a file-freshness policy for Talend `.item` files:
+The repository scan follows a semantic freshness policy for Talend `.item` files. Talend Studio may change XML layout details, component coordinates, or visual metadata even when the ETL logic did not change. The RAG index should not be rebuilt for those layout-only changes.
+
+The scanner therefore computes `source_hash` from parsed semantic evidence instead of raw file bytes:
+
+- component types
+- SQL signatures, tables, and columns
+- context references
+- URLs and endpoint evidence
+- auth/config signals
+- routine/code keywords
+- child job dependencies
+
+The intended policy:
 
 ```text
 New .item file
@@ -119,11 +198,11 @@ New .item file
   -> summary_status = pending
   -> needs summary and embedding
 
-Existing .item file with same source_hash
+Existing .item file with same semantic source_hash
   -> skip
   -> keep current summary, catalog evidence, and embeddings
 
-Existing .item file with changed source_hash
+Existing .item file with changed semantic source_hash
   -> update artifact metadata
   -> reset functional/connectivity hashes
   -> clear embedding text/vector/hash/model
@@ -131,7 +210,74 @@ Existing .item file with changed source_hash
   -> downstream summary and embedding rebuild required
 ```
 
-This is the key operational rule for the RAG demo: **only changed Talend artifacts should invalidate derived context.**
+Layout-only Talend changes, such as moving a component on the design canvas, should keep the same semantic `source_hash` and avoid RAG invalidation.
+
+This is the key operational rule for the RAG demo: **only meaningful Talend artifact changes should invalidate derived context.**
+
+### Re-Indexing Logic
+
+The RAG refresh process is intentionally staged:
+
+```text
+Scan Local Repositories
+  -> discover .item files
+  -> compute semantic source_hash
+  -> insert new artifacts
+  -> mark changed artifacts pending
+  -> skip unchanged artifacts
+
+Generate Summaries
+  -> parse pending or semantically changed artifacts
+  -> rebuild summary/search/embedding text
+  -> rebuild evidence_json
+  -> update functional/connectivity hashes
+  -> preserve vulnerability evidence where applicable
+
+Build Embeddings
+  -> compute embedding source hash from embedding text
+  -> skip embeddings when source text and model are unchanged
+  -> update pgvector only when embedding input changed
+
+Catalog Scan
+  -> compute scan hash for catalog input
+  -> skip when input scan hash is unchanged
+  -> replace catalog findings when changed
+
+Vulnerability Scan
+  -> compute dependency/pom scan hash
+  -> skip unchanged dependency inputs
+  -> update findings when dependency evidence changes
+```
+
+This creates a practical RAG invalidation model:
+
+- source behavior unchanged -> keep retrieved context
+- parsed evidence changed -> regenerate summaries and evidence
+- embedding text changed -> rebuild embeddings
+- catalog input changed -> rebuild catalog findings
+- dependency evidence changed -> rebuild vulnerability findings
+
+The goal is to avoid expensive or noisy re-indexing while keeping the KB fresh when Talend logic actually changes.
+
+### Why This Is RAG, Not Just Search
+
+This project demonstrates the full RAG pattern:
+
+```text
+Retrieve
+  Find relevant Talend artifacts, catalog rows, dependencies, and vulnerability evidence.
+
+Augment
+  Attach parsed context: SQL, tables, columns, components, contexts, auth/config signals, summaries, and graph relationships.
+
+Generate
+  Produce grounded summaries, match explanations, vulnerability views, and ETL blueprints.
+
+Validate / Refresh
+  Use semantic hashes and embedding hashes to decide when derived context must be rebuilt.
+```
+
+That makes the KB suitable for future agent workflows such as impact analysis, modernization planning, blueprint generation, and controlled code generation.
 
 ## Project Architecture
 

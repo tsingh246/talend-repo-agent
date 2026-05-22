@@ -1,7 +1,9 @@
-import hashlib
 from datetime import datetime
 from pathlib import Path
 from typing import List, Dict
+
+from parsers.item_parser import parse_item_file
+from services.summary_service import build_artifact_hashes, stable_hash
 
 
 BASE_REPO_PATH = Path("data/repos")
@@ -35,6 +37,7 @@ def scan_repositories() -> List[Dict]:
 
                 if not artifact_type:
                     continue
+                source_hash = compute_semantic_source_hash(file_path, artifact_type)
 
                 artifacts.append(
                     {
@@ -49,7 +52,7 @@ def scan_repositories() -> List[Dict]:
                         "summary": "Discovered artifact (not parsed yet)",
                         "search_text": file_path.stem.lower(),
                         "component_types": "",
-                        "source_hash": compute_file_hash(file_path),
+                        "source_hash": source_hash,
                         "source_modified_at": datetime.fromtimestamp(file_path.stat().st_mtime),
                     }
                 )
@@ -65,9 +68,14 @@ def classify_artifact(relative_path: str) -> str | None:
     return None
 
 
-def compute_file_hash(path: Path) -> str:
-    hasher = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            hasher.update(chunk)
-    return hasher.hexdigest()
+def compute_semantic_source_hash(path: Path, artifact_type: str) -> str:
+    parsed = parse_item_file(str(path), artifact_type)
+    parsed["name"] = path.stem
+    functional_hash, connectivity_hash = build_artifact_hashes(artifact_type, parsed)
+    return stable_hash(
+        {
+            "artifact_type": artifact_type,
+            "functional_hash": functional_hash,
+            "connectivity_hash": connectivity_hash,
+        }
+    )
